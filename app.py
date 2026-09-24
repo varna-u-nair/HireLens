@@ -3,6 +3,82 @@ import re
 import streamlit as st
 from pypdf import PdfReader
 from google import genai
+from google.genai import errors, types
+
+
+# ============================================================
+# GEMINI SETTINGS
+# ============================================================
+
+PRIMARY_MODEL = "gemini-3.1-flash-lite"
+FALLBACK_MODEL = "gemini-3.5-flash-lite"
+
+MAX_RESUME_CHARS = 12000
+MAX_JOB_CHARS = 12000
+
+
+# ============================================================
+# GEMINI HELPER
+# ============================================================
+
+def generate_gemini_response(prompt, max_output_tokens=800):
+    """
+    Send a prompt to Gemini.
+
+    Primary model is tried first.
+    Fallback model is used for temporary API errors.
+    """
+
+    client = genai.Client()
+
+    try:
+
+        response = client.models.generate_content(
+            model=PRIMARY_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                max_output_tokens=max_output_tokens
+            )
+        )
+
+        if not response.text:
+            raise RuntimeError(
+                "Gemini returned an empty response."
+            )
+
+        return response.text
+
+    except errors.APIError as first_error:
+
+        # Retry only for temporary errors
+        if first_error.code not in (429, 500, 503, 504):
+            raise first_error
+
+        try:
+
+            response = client.models.generate_content(
+                model=FALLBACK_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    max_output_tokens=max_output_tokens
+                )
+            )
+
+            if not response.text:
+                raise RuntimeError(
+                    "Gemini returned an empty response."
+                )
+
+            return response.text
+
+        except errors.APIError as second_error:
+
+            raise RuntimeError(
+                f"Gemini request failed.\n"
+                f"Primary model error: {first_error.code}\n"
+                f"Fallback model error: {second_error.code}\n"
+                f"Please try again later."
+            ) from second_error
 
 
 # ============================================================
@@ -10,21 +86,25 @@ from google import genai
 # ============================================================
 
 def generate_ai_questions(resume_text, job_description):
-    client = genai.Client()
+
+    resume_text = resume_text[:MAX_RESUME_CHARS]
+    job_description = job_description[:MAX_JOB_CHARS]
 
     prompt = f"""
 You are an interview preparation assistant.
 
-Create 5 interview questions for a student applying for the job below.
+Create exactly 5 interview questions for a student applying
+for the job below.
 
 Use BOTH:
 1. The student's resume
 2. The job description
 
 The questions should test:
+
 - Technical skills required by the job
 - Skills mentioned in the resume
-- The student's projects or experience
+- Projects or experience mentioned in the resume
 - One question about a skill the student is missing
 
 Job Description:
@@ -33,28 +113,29 @@ Job Description:
 Resume:
 {resume_text}
 
-Return only the 5 questions as a numbered list.
+Return ONLY the 5 questions as a numbered list.
+Do not include explanations or answers.
 """
 
-    try:
-        response = client.models.generate_content(
-            model="gemini-3.1-flash-lite",
-            contents=prompt
-        )
-    except Exception:
-        response = client.models.generate_content(
-            model="gemini-3.5-flash-lite",
-            contents=prompt
-        )
-
-    return response.text
+    return generate_gemini_response(
+        prompt,
+        max_output_tokens=600
+    )
 
 
-def evaluate_answer(question, answer, resume_text, job_description):
-    client = genai.Client()
+def evaluate_answer(
+    question,
+    answer,
+    resume_text,
+    job_description
+):
+
+    resume_text = resume_text[:MAX_RESUME_CHARS]
+    job_description = job_description[:MAX_JOB_CHARS]
 
     prompt = f"""
-You are an interview coach helping a student prepare for a job interview.
+You are an interview coach helping a student prepare
+for a job interview.
 
 Evaluate the student's answer to the interview question.
 
@@ -70,7 +151,7 @@ Job Description:
 Resume:
 {resume_text}
 
-Give feedback in exactly these sections:
+Give feedback using exactly these sections:
 
 1. What you did well
 2. What could be improved
@@ -78,27 +159,24 @@ Give feedback in exactly these sections:
 4. A stronger example answer
 
 Be constructive and specific.
-Do not claim that your evaluation is an actual hiring decision.
+
+Do not claim that this is an actual hiring decision.
 """
 
-    try:
-        response = client.models.generate_content(
-            model="gemini-3.1-flash-lite",
-            contents=prompt
-        )
-    except Exception:
-        response = client.models.generate_content(
-            model="gemini-3.5-flash-lite",
-            contents=prompt
-        )
-
-    return response.text
+    return generate_gemini_response(
+        prompt,
+        max_output_tokens=900
+    )
 
 
-def generate_skill_recommendations(missing_skills, job_description):
-    client = genai.Client()
+def generate_skill_recommendations(
+    missing_skills,
+    job_description
+):
 
     skills_text = ", ".join(missing_skills)
+
+    job_description = job_description[:MAX_JOB_CHARS]
 
     prompt = f"""
 You are a career guidance assistant.
@@ -108,29 +186,24 @@ The student is applying for this job:
 Job Description:
 {job_description}
 
-The following skills were detected as missing from the student's resume:
+The following skills were detected as missing
+from the student's resume:
+
 {skills_text}
 
-For each missing skill:
+For EACH missing skill:
+
 1. Explain briefly why it matters for this job.
 2. Give 2-3 specific things the student should learn or practice.
-3. Keep the advice practical for a student.
+3. Keep the advice practical for a college student.
 
 Return the result as a clear numbered list.
 """
 
-    try:
-        response = client.models.generate_content(
-            model="gemini-3.1-flash-lite",
-            contents=prompt
-        )
-    except Exception:
-        response = client.models.generate_content(
-            model="gemini-3.5-flash-lite",
-            contents=prompt
-        )
-
-    return response.text
+    return generate_gemini_response(
+        prompt,
+        max_output_tokens=900
+    )
 
 
 # ============================================================
@@ -139,11 +212,45 @@ Return the result as a clear numbered list.
 
 def contains_skill(text, skill):
     """
-    Check whether a skill appears as a real word/phrase
-    instead of just appearing as part of another word.
+    Check whether a skill appears as a real word/phrase.
     """
+
     pattern = r"(?<!\w)" + re.escape(skill) + r"(?!\w)"
-    return re.search(pattern, text, re.IGNORECASE) is not None
+
+    return re.search(
+        pattern,
+        text,
+        re.IGNORECASE
+    ) is not None
+
+
+def contains_c_skill(text):
+    """
+    Special handling for C because searching for the
+    standalone letter 'c' would create loads of false matches.
+    """
+
+    c_patterns = [
+        r"\bc programming\b",
+        r"\bc language\b",
+        r"\bprogramming in c\b",
+        r"\bc developer\b",
+        r"\bc development\b",
+        r"\busing c\b",
+        r"\bc\s+programming\b",
+        r"\bansi c\b"
+    ]
+
+    for pattern in c_patterns:
+
+        if re.search(
+            pattern,
+            text,
+            re.IGNORECASE
+        ):
+            return True
+
+    return False
 
 
 def clean_resume_for_ai(resume_text):
@@ -151,6 +258,7 @@ def clean_resume_for_ai(resume_text):
     Remove unnecessary contact information before sending
     resume text to Gemini.
     """
+
     # Remove email addresses
     resume_text = re.sub(
         r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
@@ -165,7 +273,7 @@ def clean_resume_for_ai(resume_text):
         resume_text
     )
 
-    # Remove common profile URLs
+    # Remove URLs
     resume_text = re.sub(
         r"https?://\S+",
         "[LINK REMOVED]",
@@ -208,59 +316,241 @@ st.divider()
 # SKILLS
 # ============================================================
 
-skills = [
-    "python",
-    "java",
-    "c",
-    "c++",
-    "javascript",
-    "html",
-    "css",
-    "sql",
-    "pandas",
-    "numpy",
-    "machine learning",
-    "deep learning",
-    "data science",
-    "git",
-    "github",
-    "streamlit",
-    "django",
-    "flask",
-    "react",
-    "tensorflow",
-    "pytorch",
-    "excel"
-]
+skill_patterns = {
+
+    "python": [
+        "python"
+    ],
+
+    "java": [
+        "java"
+    ],
+
+    "c++": [
+        "c++",
+        "cpp"
+    ],
+
+    "c#": [
+        "c#",
+        "c sharp"
+    ],
+
+    "javascript": [
+        "javascript",
+        "java script"
+    ],
+
+    "typescript": [
+        "typescript"
+    ],
+
+    "html": [
+        "html",
+        "html5"
+    ],
+
+    "css": [
+        "css",
+        "css3"
+    ],
+
+    "react": [
+        "react",
+        "react.js",
+        "reactjs"
+    ],
+
+    "angular": [
+        "angular"
+    ],
+
+    "vue": [
+        "vue",
+        "vue.js",
+        "vuejs"
+    ],
+
+    "node.js": [
+        "node.js",
+        "nodejs",
+        "node js"
+    ],
+
+    "express": [
+        "express",
+        "express.js",
+        "expressjs"
+    ],
+
+    "django": [
+        "django"
+    ],
+
+    "flask": [
+        "flask"
+    ],
+
+    "sql": [
+        "sql"
+    ],
+
+    "mysql": [
+        "mysql"
+    ],
+
+    "postgresql": [
+        "postgresql",
+        "postgres"
+    ],
+
+    "mongodb": [
+        "mongodb",
+        "mongo db"
+    ],
+
+    "sqlite": [
+        "sqlite"
+    ],
+
+    "pandas": [
+        "pandas"
+    ],
+
+    "numpy": [
+        "numpy"
+    ],
+
+    "scikit-learn": [
+        "scikit-learn",
+        "scikit learn",
+        "sklearn"
+    ],
+
+    "tensorflow": [
+        "tensorflow"
+    ],
+
+    "pytorch": [
+        "pytorch"
+    ],
+
+    "machine learning": [
+        "machine learning",
+        "machine-learning"
+    ],
+
+    "deep learning": [
+        "deep learning",
+        "deep-learning"
+    ],
+
+    "data science": [
+        "data science",
+        "data-science"
+    ],
+
+    "artificial intelligence": [
+        "artificial intelligence",
+        "artificial intelligence (ai)",
+        "ai"
+    ],
+
+    "git": [
+        "git"
+    ],
+
+    "github": [
+        "github",
+        "github.com"
+    ],
+
+    "docker": [
+        "docker"
+    ],
+
+    "kubernetes": [
+        "kubernetes",
+        "k8s"
+    ],
+
+    "aws": [
+        "aws",
+        "amazon web services"
+    ],
+
+    "azure": [
+        "azure",
+        "microsoft azure"
+    ],
+
+    "google cloud": [
+        "google cloud",
+        "gcp",
+        "google cloud platform"
+    ],
+
+    "rest api": [
+        "rest api",
+        "rest apis",
+        "restful api",
+        "restful apis",
+        "restful services"
+    ],
+
+    "streamlit": [
+        "streamlit"
+    ],
+
+    "excel": [
+        "excel",
+        "microsoft excel"
+    ],
+
+    "power bi": [
+        "power bi",
+        "powerbi"
+    ],
+
+    "tableau": [
+        "tableau"
+    ]
+}
 
 
 # ============================================================
 # SESSION STATE
 # ============================================================
 
-if "analysis_done" not in st.session_state:
-    st.session_state.analysis_done = False
+defaults = {
 
-if "required_skills" not in st.session_state:
-    st.session_state.required_skills = []
+    "analysis_done": False,
 
-if "matched_skills" not in st.session_state:
-    st.session_state.matched_skills = []
+    "required_skills": [],
 
-if "missing_skills" not in st.session_state:
-    st.session_state.missing_skills = []
+    "matched_skills": [],
 
-if "resume_text" not in st.session_state:
-    st.session_state.resume_text = ""
+    "missing_skills": [],
 
-if "match_score" not in st.session_state:
-    st.session_state.match_score = 0
+    "resume_text": "",
 
-if "current_question" not in st.session_state:
-    st.session_state.current_question = 0
+    "match_score": None,
 
-if "answer_feedback" not in st.session_state:
-    st.session_state.answer_feedback = ""
+    "current_question": 0,
+
+    "answer_feedback": "",
+
+    "ai_questions": "",
+
+    "skill_recommendations": ""
+
+}
+
+for key, value in defaults.items():
+
+    if key not in st.session_state:
+
+        st.session_state[key] = value
 
 
 # ============================================================
@@ -284,7 +574,10 @@ st.header("💼 Job Description")
 job_description = st.text_area(
     "Paste the job description here",
     height=250,
-    placeholder="Paste the job description here..."
+    placeholder=(
+        "Paste the full job description here, "
+        "not just the job title..."
+    )
 )
 
 
@@ -292,51 +585,133 @@ job_description = st.text_area(
 # ANALYZE
 # ============================================================
 
-if st.button("🚀 Analyze", use_container_width=True):
+if st.button(
+    "🚀 Analyze",
+    use_container_width=True
+):
 
     if resume is None:
 
-        st.warning("Please upload your resume.")
+        st.warning(
+            "Please upload your resume."
+        )
 
     elif not job_description.strip():
 
-        st.warning("Please paste a job description.")
+        st.warning(
+            "Please paste a job description."
+        )
 
     else:
 
         # ----------------------------------------------------
-        # Read resume PDF
+        # Read PDF
         # ----------------------------------------------------
 
-        reader = PdfReader(resume)
+        try:
 
-        resume_text = ""
+            reader = PdfReader(resume)
 
-        for page in reader.pages:
+            resume_text = ""
 
-            text = page.extract_text()
+            for page in reader.pages:
 
-            if text:
-                resume_text += text + "\n"
+                text = page.extract_text()
 
-        # Convert to lowercase for skill matching
+                if text:
+
+                    resume_text += text + "\n"
+
+        except Exception as e:
+
+            st.error(
+                "HireLens could not read this PDF."
+            )
+
+            st.code(str(e))
+
+            st.stop()
+
+        # ----------------------------------------------------
+        # Check extracted text
+        # ----------------------------------------------------
+
+        if not resume_text.strip():
+
+            st.error(
+                "No readable text was found in this PDF. "
+                "Please upload a text-based PDF resume."
+            )
+
+            st.stop()
+
+        # ----------------------------------------------------
+        # Convert to lowercase
+        # ----------------------------------------------------
+
         resume_text_lower = resume_text.lower()
+
         job_text = job_description.lower()
 
         # ----------------------------------------------------
-        # Detect skills
+        # Detect resume skills
         # ----------------------------------------------------
 
         resume_skills = []
+
+        # Special C detection
+        if contains_c_skill(resume_text_lower):
+
+            resume_skills.append("c")
+
+        for skill, patterns in skill_patterns.items():
+
+            for pattern in patterns:
+
+                if contains_skill(
+                    resume_text_lower,
+                    pattern
+                ):
+
+                    resume_skills.append(skill)
+
+                    break
+
+        # ----------------------------------------------------
+        # Detect job skills
+        # ----------------------------------------------------
+
         required_skills = []
 
-        for skill in skills:
+        # Special C detection
+        if contains_c_skill(job_text):
 
-            if contains_skill(resume_text_lower, skill):
-                resume_skills.append(skill)
+            required_skills.append("c")
 
-            if contains_skill(job_text, skill):
-                required_skills.append(skill)
+        for skill, patterns in skill_patterns.items():
+
+            for pattern in patterns:
+
+                if contains_skill(
+                    job_text,
+                    pattern
+                ):
+
+                    required_skills.append(skill)
+
+                    break
+
+        # ----------------------------------------------------
+        # Remove duplicates
+        # ----------------------------------------------------
+
+        resume_skills = list(
+            dict.fromkeys(resume_skills)
+        )
+
+        required_skills = list(
+            dict.fromkeys(required_skills)
+        )
 
         # ----------------------------------------------------
         # Matched skills
@@ -347,6 +722,7 @@ if st.button("🚀 Analyze", use_container_width=True):
         for skill in required_skills:
 
             if skill in resume_skills:
+
                 matched_skills.append(skill)
 
         # ----------------------------------------------------
@@ -358,13 +734,14 @@ if st.button("🚀 Analyze", use_container_width=True):
         for skill in required_skills:
 
             if skill not in resume_skills:
+
                 missing_skills.append(skill)
 
         # ----------------------------------------------------
         # Match score
         # ----------------------------------------------------
 
-        if len(required_skills) > 0:
+        if required_skills:
 
             match_score = (
                 len(matched_skills)
@@ -373,7 +750,7 @@ if st.button("🚀 Analyze", use_container_width=True):
 
         else:
 
-            match_score = 0
+            match_score = None
 
         # ----------------------------------------------------
         # Save results
@@ -381,21 +758,34 @@ if st.button("🚀 Analyze", use_container_width=True):
 
         st.session_state.analysis_done = True
 
-        st.session_state.required_skills = required_skills
+        st.session_state.required_skills = (
+            required_skills
+        )
 
-        st.session_state.matched_skills = matched_skills
+        st.session_state.matched_skills = (
+            matched_skills
+        )
 
-        st.session_state.missing_skills = missing_skills
+        st.session_state.missing_skills = (
+            missing_skills
+        )
 
-        st.session_state.match_score = match_score
+        st.session_state.match_score = (
+            match_score
+        )
 
-        st.session_state.resume_text = resume_text
+        st.session_state.resume_text = (
+            resume_text
+        )
 
-        # Reset previous AI results
-        st.session_state.pop("ai_questions", None)
-        st.session_state.pop("skill_recommendations", None)
+        # Reset AI results
+
+        st.session_state.ai_questions = ""
+
+        st.session_state.skill_recommendations = ""
 
         st.session_state.current_question = 0
+
         st.session_state.answer_feedback = ""
 
 
@@ -411,34 +801,76 @@ if st.session_state.analysis_done:
 
     col1, col2, col3 = st.columns(3)
 
+    # --------------------------------------------------------
+    # Match score
+    # --------------------------------------------------------
+
     with col1:
 
-        st.metric(
-            "Job Match",
-            f"{st.session_state.match_score:.0f}%"
-        )
+        if st.session_state.match_score is not None:
+
+            st.metric(
+                "Job Match",
+                f"{st.session_state.match_score:.0f}%"
+            )
+
+        else:
+
+            st.metric(
+                "Job Match",
+                "N/A"
+            )
+
+    # --------------------------------------------------------
+    # Matched skills
+    # --------------------------------------------------------
 
     with col2:
 
         st.metric(
             "Matched Skills",
-            len(st.session_state.matched_skills)
+            len(
+                st.session_state.matched_skills
+            )
         )
+
+    # --------------------------------------------------------
+    # Missing skills
+    # --------------------------------------------------------
 
     with col3:
 
         st.metric(
             "Skills to Improve",
-            len(st.session_state.missing_skills)
+            len(
+                st.session_state.missing_skills
+            )
         )
 
-    st.progress(
-        int(st.session_state.match_score),
-        text=(
-            f"Overall Match: "
-            f"{st.session_state.match_score:.0f}%"
+    # --------------------------------------------------------
+    # Progress bar
+    # --------------------------------------------------------
+
+    if st.session_state.match_score is not None:
+
+        st.progress(
+            int(
+                st.session_state.match_score
+            ),
+            text=(
+                f"Overall Match: "
+                f"{st.session_state.match_score:.0f}%"
+            )
         )
-    )
+
+    else:
+
+        st.info(
+            "No recognizable skills were detected "
+            "in the job description. Please paste "
+            "the full job description instead of "
+            "only the job title."
+        )
 
     # ========================================================
     # MATCHED / MISSING SKILLS
@@ -448,33 +880,63 @@ if st.session_state.analysis_done:
 
     col1, col2 = st.columns(2)
 
+    # --------------------------------------------------------
+    # Matched
+    # --------------------------------------------------------
+
     with col1:
 
-        st.subheader("✅ Matched Skills")
+        st.subheader(
+            "✅ Matched Skills"
+        )
 
         if st.session_state.matched_skills:
 
-            for skill in st.session_state.matched_skills:
+            for skill in (
+                st.session_state.matched_skills
+            ):
 
-                st.success(skill.title())
+                st.success(
+                    skill.title()
+                )
 
         else:
 
-            st.info("No matching skills found.")
+            st.info(
+                "No matching skills found."
+            )
+
+    # --------------------------------------------------------
+    # Missing
+    # --------------------------------------------------------
 
     with col2:
 
-        st.subheader("❌ Missing Skills")
+        st.subheader(
+            "❌ Missing Skills"
+        )
 
         if st.session_state.missing_skills:
 
-            for skill in st.session_state.missing_skills:
+            for skill in (
+                st.session_state.missing_skills
+            ):
 
-                st.error(skill.title())
+                st.error(
+                    skill.title()
+                )
+
+        elif st.session_state.required_skills:
+
+            st.success(
+                "No missing skills! 🎉"
+            )
 
         else:
 
-            st.success("No missing skills! 🎉")
+            st.info(
+                "No job skills were detected."
+            )
 
     # ========================================================
     # RECOMMENDED SKILLS
@@ -482,7 +944,9 @@ if st.session_state.analysis_done:
 
     st.divider()
 
-    st.header("📚 Recommended Skills")
+    st.header(
+        "📚 Recommended Skills"
+    )
 
     if st.session_state.missing_skills:
 
@@ -490,21 +954,30 @@ if st.session_state.analysis_done:
             "Skills you may want to improve:"
         )
 
-        for skill in st.session_state.missing_skills:
+        for skill in (
+            st.session_state.missing_skills
+        ):
 
             st.write(
                 f"👉 **{skill.title()}**"
             )
 
-    else:
+    elif st.session_state.required_skills:
 
         st.success(
             "Your resume covers all detected skills!"
         )
 
-    # --------------------------------------------------------
+    else:
+
+        st.info(
+            "No skills were detected from the "
+            "job description."
+        )
+
+    # ========================================================
     # AI SKILL GAP GUIDANCE
-    # --------------------------------------------------------
+    # ========================================================
 
     if st.session_state.missing_skills:
 
@@ -533,45 +1006,49 @@ if st.session_state.analysis_done:
                 except Exception as e:
 
                     st.error(
-                        "Something went wrong while generating "
-                        "skill recommendations."
+                        "Gemini could not generate "
+                        "skill-gap guidance right now."
+                    )
+
+                    st.info(
+                        "Please try again in a moment."
                     )
 
                     st.code(str(e))
 
-    if "skill_recommendations" in st.session_state:
+        # ----------------------------------------------------
+        # Display recommendations
+        # ----------------------------------------------------
 
-        st.divider()
+        if st.session_state.skill_recommendations:
 
-        st.subheader("🧭 AI Skill Gap Guidance")
+            st.subheader(
+                "💡 Gemini's Skill Gap Guidance"
+            )
 
-        st.write(
-            st.session_state.skill_recommendations
-        )
+            st.markdown(
+                st.session_state.skill_recommendations
+            )
 
     # ========================================================
-    # AI INTERVIEW MODE
+    # INTERVIEW PREPARATION
     # ========================================================
 
     st.divider()
 
-    st.header("🎤 AI Interview Mode")
+    st.header(
+        "🎤 AI Interview Preparation"
+    )
 
     st.write(
-        "Generate personalized interview questions using "
-        "your resume and the job description."
+        "Generate interview questions based on "
+        "your resume and this job description."
     )
 
     if st.button(
-        "🤖 Generate AI Questions",
+        "🎯 Generate Interview Questions",
         use_container_width=True
     ):
-
-        # Remove unnecessary personal information
-        # before sending resume text to Gemini.
-        ai_resume_text = clean_resume_for_ai(
-            st.session_state.resume_text
-        )
 
         with st.spinner(
             "Gemini is creating your interview questions..."
@@ -579,177 +1056,167 @@ if st.session_state.analysis_done:
 
             try:
 
-                ai_questions = generate_ai_questions(
-                    ai_resume_text,
+                clean_resume = clean_resume_for_ai(
+                    st.session_state.resume_text
+                )
+
+                questions = generate_ai_questions(
+                    clean_resume,
                     job_description
                 )
 
-                st.session_state.ai_questions = ai_questions
+                st.session_state.ai_questions = (
+                    questions
+                )
 
-                # Start from question 1
                 st.session_state.current_question = 0
+
                 st.session_state.answer_feedback = ""
 
             except Exception as e:
 
                 st.error(
-                    "Something went wrong while generating "
-                    "the interview questions."
+                    "Gemini could not generate "
+                    "interview questions."
+                )
+
+                st.info(
+                    "Please check your Gemini API key "
+                    "and try again."
                 )
 
                 st.code(str(e))
 
     # ========================================================
-    # INTERVIEW PRACTICE
+    # DISPLAY INTERVIEW QUESTIONS
     # ========================================================
 
-    if "ai_questions" in st.session_state:
+    if st.session_state.ai_questions:
 
-        questions = []
+        st.subheader(
+            "📝 Interview Questions"
+        )
 
-        for line in (
-            st.session_state.ai_questions.splitlines()
+        st.markdown(
+            st.session_state.ai_questions
+        )
+
+        st.divider()
+
+        st.subheader(
+            "🧑‍💻 Practice Your Answer"
+        )
+
+        answer = st.text_area(
+            "Write your answer here:",
+            height=180,
+            placeholder=(
+                "Type how you would answer "
+                "the interview question..."
+            )
+        )
+
+        question_number = st.number_input(
+            "Question number",
+            min_value=1,
+            max_value=5,
+            value=1,
+            step=1
+        )
+
+        if st.button(
+            "🤖 Evaluate My Answer",
+            use_container_width=True
         ):
 
-            line = line.strip()
+            if not answer.strip():
 
-            # Accept formats such as:
-            # 1. Question
-            # 1) Question
-            if (
-                len(line) > 2
-                and line[0].isdigit()
-                and line[1] in ".)"
-            ):
-
-                questions.append(
-                    line[2:].strip()
+                st.warning(
+                    "Please write an answer first."
                 )
 
-        if questions:
+            else:
 
-            # Make sure the question number is valid
-            if (
-                st.session_state.current_question
-                >= len(questions)
-            ):
+                # Try to extract numbered questions
+                question_matches = re.findall(
+                    r"(?:^|\n)\s*\d+[.)]\s*(.+)",
+                    st.session_state.ai_questions
+                )
 
-                st.session_state.current_question = 0
+                if question_matches and len(
+                    question_matches
+                ) >= question_number:
 
-            current = (
-                st.session_state.current_question
-            )
+                    selected_question = (
+                        question_matches[
+                            question_number - 1
+                        ]
+                    )
+
+                else:
+
+                    selected_question = (
+                        "Interview question "
+                        f"{question_number}"
+                    )
+
+                with st.spinner(
+                    "Gemini is evaluating your answer..."
+                ):
+
+                    try:
+
+                        clean_resume = (
+                            clean_resume_for_ai(
+                                st.session_state.resume_text
+                            )
+                        )
+
+                        feedback = evaluate_answer(
+                            selected_question,
+                            answer,
+                            clean_resume,
+                            job_description
+                        )
+
+                        st.session_state.answer_feedback = (
+                            feedback
+                        )
+
+                    except Exception as e:
+
+                        st.error(
+                            "Gemini could not evaluate "
+                            "your answer."
+                        )
+
+                        st.code(str(e))
+
+        # ----------------------------------------------------
+        # Display feedback
+        # ----------------------------------------------------
+
+        if st.session_state.answer_feedback:
+
+            st.divider()
 
             st.subheader(
-                "🧠 AI Interview Practice"
+                "📊 Interview Feedback"
             )
 
-            st.write(
-                f"Question {current + 1} "
-                f"of {len(questions)}"
+            st.markdown(
+                st.session_state.answer_feedback
             )
 
-            st.info(
-                questions[current]
-            )
 
-            answer = st.text_area(
-                "Your answer",
-                key=f"answer_{current}",
-                height=180,
-                placeholder=(
-                    "Type your interview answer here..."
-                )
-            )
+# ============================================================
+# FOOTER
+# ============================================================
 
-            # ------------------------------------------------
-            # Evaluate answer
-            # ------------------------------------------------
+st.divider()
 
-            if st.button(
-                "🤖 Evaluate My Answer",
-                use_container_width=True
-            ):
-
-                if not answer.strip():
-
-                    st.warning(
-                        "Please write an answer first."
-                    )
-
-                else:
-
-                    ai_resume_text = (
-                        clean_resume_for_ai(
-                            st.session_state.resume_text
-                        )
-                    )
-
-                    with st.spinner(
-                        "Gemini is evaluating your answer..."
-                    ):
-
-                        try:
-
-                            feedback = evaluate_answer(
-                                questions[current],
-                                answer,
-                                ai_resume_text,
-                                job_description
-                            )
-
-                            st.session_state.answer_feedback = (
-                                feedback
-                            )
-
-                        except Exception as e:
-
-                            st.error(
-                                "Something went wrong while "
-                                "evaluating your answer."
-                            )
-
-                            st.code(str(e))
-
-            # ------------------------------------------------
-            # Feedback
-            # ------------------------------------------------
-
-            if st.session_state.answer_feedback:
-
-                st.divider()
-
-                st.subheader("📝 AI Feedback")
-
-                st.write(
-                    st.session_state.answer_feedback
-                )
-
-                # --------------------------------------------
-                # Next question
-                # --------------------------------------------
-
-                if current < len(questions) - 1:
-
-                    if st.button(
-                        "➡️ Next Question",
-                        use_container_width=True
-                    ):
-
-                        st.session_state.current_question += 1
-
-                        st.session_state.answer_feedback = ""
-
-                        st.rerun()
-
-                else:
-
-                    st.success(
-                        "🎉 Interview practice complete!"
-                    )
-
-        else:
-
-            st.warning(
-                "Could not read the generated questions."
-            )
+st.caption(
+    "HireLens helps students compare their resume "
+    "with job descriptions and prepare for interviews. "
+    "Results are AI-generated and should be used as guidance."
+)
